@@ -1,3 +1,4 @@
+
 // require('dotenv').config();
 // const express    = require('express');
 // const http       = require('http');
@@ -17,11 +18,29 @@
 // const app    = express();
 // const server = http.createServer(app);
 
-// const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173';
+// // ── CORS Configuration ────────────────────────────────────────────────
+// // Support multiple origins from environment variable or fallback to localhost
+// const allowedOrigins = process.env.ALLOWED_ORIGINS 
+//   ? process.env.ALLOWED_ORIGINS.split(',')
+//   : [process.env.FRONTEND_URL || 'http://localhost:5173'];
+
+// console.log('✅ CORS allowed origins:', allowedOrigins);
+// console.log('🌍 FRONTEND_URL:', process.env.FRONTEND_URL || 'not set');
+// console.log('📋 ALLOWED_ORIGINS:', process.env.ALLOWED_ORIGINS || 'not set (using FRONTEND_URL)');
 
 // const io = new Server(server, {
 //   cors: {
-//     origin: FRONTEND_URL,
+//     origin: function(origin, callback) {
+//       // Allow requests with no origin (like mobile apps, curl, Postman)
+//       if (!origin) return callback(null, true);
+      
+//       if (allowedOrigins.includes(origin)) {
+//         callback(null, true);
+//       } else {
+//         console.log(`❌ Socket.IO CORS blocked origin: ${origin}`);
+//         callback(new Error('CORS not allowed for this origin'));
+//       }
+//     },
 //     methods: ['GET', 'POST'],
 //     credentials: true,
 //   },
@@ -35,7 +54,20 @@
 
 // // ── Middleware ─────────────────────────────────────────────────────────────────
 // app.use(helmet({ contentSecurityPolicy: false }));
-// app.use(cors({ origin: FRONTEND_URL, credentials: true }));
+// app.use(cors({ 
+//   origin: function(origin, callback) {
+//     // Allow requests with no origin (like mobile apps, curl, Postman)
+//     if (!origin) return callback(null, true);
+    
+//     if (allowedOrigins.includes(origin)) {
+//       callback(null, true);
+//     } else {
+//       console.log(`❌ Express CORS blocked origin: ${origin}`);
+//       callback(new Error('CORS not allowed for this origin'));
+//     }
+//   },
+//   credentials: true 
+// }));
 // app.use(express.json({ limit: '10mb' }));
 
 // const defaultLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 1000, standardHeaders: true });
@@ -54,7 +86,7 @@
 
 // app.get('/health', (req, res) => {
 //   const stats = botManager.getServerStats();
-//   res.json({ status: 'ok', uptime: process.uptime(), ...stats });
+//   res.json({ status: 'ok', uptime: process.uptime(), ...stats, corsOrigins: allowedOrigins });
 // });
 
 // // ── Socket Auth ────────────────────────────────────────────────────────────────
@@ -101,7 +133,8 @@
 // const PORT = process.env.PORT || 3001;
 // server.listen(PORT, () => {
 //   console.log(`\n🔥 FireKirin Web Backend running on :${PORT}`);
-//   console.log(`🌐 Frontend URL: ${FRONTEND_URL}`);
+//   console.log(`🌐 Frontend URL: ${process.env.FRONTEND_URL || 'http://localhost:5173'}`);
+//   console.log(`🔒 CORS enabled for: ${allowedOrigins.join(', ')}`);
 //   console.log(`📁 Data dir: ${path.resolve(dataDir)}\n`);
 // });
 
@@ -115,6 +148,7 @@
 //   await botManager.shutdownAll();
 //   server.close(() => process.exit(0));
 // });
+
 
 
 
@@ -137,9 +171,13 @@ const BotManager       = require('./botManager');
 const app    = express();
 const server = http.createServer(app);
 
-// ── CORS Configuration ────────────────────────────────────────────────
-// Support multiple origins from environment variable or fallback to localhost
-const allowedOrigins = process.env.ALLOWED_ORIGINS 
+// ── Trust Render's reverse proxy ───────────────────────────────────────────────
+// CRITICAL FIX: Without this, ALL users share one rate-limit bucket because
+// Express sees Render's internal proxy IP instead of each user's real IP.
+app.set('trust proxy', 1);
+
+// ── CORS Configuration ─────────────────────────────────────────────────────────
+const allowedOrigins = process.env.ALLOWED_ORIGINS
   ? process.env.ALLOWED_ORIGINS.split(',')
   : [process.env.FRONTEND_URL || 'http://localhost:5173'];
 
@@ -149,10 +187,8 @@ console.log('📋 ALLOWED_ORIGINS:', process.env.ALLOWED_ORIGINS || 'not set (us
 
 const io = new Server(server, {
   cors: {
-    origin: function(origin, callback) {
-      // Allow requests with no origin (like mobile apps, curl, Postman)
+    origin: function (origin, callback) {
       if (!origin) return callback(null, true);
-      
       if (allowedOrigins.includes(origin)) {
         callback(null, true);
       } else {
@@ -163,8 +199,13 @@ const io = new Server(server, {
     methods: ['GET', 'POST'],
     credentials: true,
   },
+  // ── WebSocket tuning for 200+ concurrent users ─────────────────────────────
   pingInterval: 25000,
   pingTimeout: 60000,
+  maxHttpBufferSize: 1e6,    // 1MB max payload — prevents memory abuse
+  transports: ['websocket'], // FIX: WebSocket only — skip long-polling fallback.
+                             // Polling creates 2-3x more HTTP requests under load
+                             // and eats into your rate limit quota very quickly.
 });
 
 // ── Data directory ─────────────────────────────────────────────────────────────
@@ -173,11 +214,9 @@ if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
 
 // ── Middleware ─────────────────────────────────────────────────────────────────
 app.use(helmet({ contentSecurityPolicy: false }));
-app.use(cors({ 
-  origin: function(origin, callback) {
-    // Allow requests with no origin (like mobile apps, curl, Postman)
+app.use(cors({
+  origin: function (origin, callback) {
     if (!origin) return callback(null, true);
-    
     if (allowedOrigins.includes(origin)) {
       callback(null, true);
     } else {
@@ -185,12 +224,57 @@ app.use(cors({
       callback(new Error('CORS not allowed for this origin'));
     }
   },
-  credentials: true 
+  credentials: true,
 }));
 app.use(express.json({ limit: '10mb' }));
 
-const defaultLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 1000, standardHeaders: true });
-const authLimiter    = rateLimit({ windowMs: 60 * 1000, max: 30 });
+// ── Rate Limiting ──────────────────────────────────────────────────────────────
+// ROOT CAUSE OF YOUR BUG:
+// The old limiter had no keyGenerator, so express-rate-limit used req.ip.
+// On Render, req.ip = Render's internal proxy IP for ALL users.
+// Result: all 200 users shared one bucket and hit 1000 req/15min together.
+//
+// FIX: Extract the Firebase UID from the JWT token and use that as the key.
+// Each logged-in user now gets their own independent rate limit bucket.
+// We decode the JWT payload (no signature verify — just reading the key).
+function extractUidFromToken(req) {
+  try {
+    const authHeader = req.headers.authorization || '';
+    if (!authHeader.startsWith('Bearer ')) return req.ip;
+    const token = authHeader.slice(7);
+    const parts  = token.split('.');
+    if (parts.length < 2) return req.ip;
+    const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString());
+    return payload.user_id || payload.sub || payload.uid || req.ip;
+  } catch {
+    return req.ip;
+  }
+}
+
+// General API limiter — 2000 requests per 15 min per user
+// 200 concurrent users doing account add/fetch = well within this
+const defaultLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 2000,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: extractUidFromToken,
+  skip: (req) => req.path === '/health',
+  handler: (req, res) => {
+    console.warn(`⚠️  Rate limit hit — user: ${extractUidFromToken(req)}`);
+    res.status(429).json({ error: 'Too many requests, please try again later.' });
+  },
+});
+
+// Strict limiter for sensitive routes
+const authLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: extractUidFromToken,
+});
+
 app.use('/api/', defaultLimiter);
 
 // ── Bot Manager ────────────────────────────────────────────────────────────────
@@ -205,7 +289,13 @@ app.use('/api/stats',      verifyToken, statsRouter);
 
 app.get('/health', (req, res) => {
   const stats = botManager.getServerStats();
-  res.json({ status: 'ok', uptime: process.uptime(), ...stats, corsOrigins: allowedOrigins });
+  res.json({
+    status: 'ok',
+    uptime: process.uptime(),
+    memory: process.memoryUsage(),   // monitor this in Render dashboard
+    ...stats,
+    corsOrigins: allowedOrigins,
+  });
 });
 
 // ── Socket Auth ────────────────────────────────────────────────────────────────
@@ -254,7 +344,8 @@ server.listen(PORT, () => {
   console.log(`\n🔥 FireKirin Web Backend running on :${PORT}`);
   console.log(`🌐 Frontend URL: ${process.env.FRONTEND_URL || 'http://localhost:5173'}`);
   console.log(`🔒 CORS enabled for: ${allowedOrigins.join(', ')}`);
-  console.log(`📁 Data dir: ${path.resolve(dataDir)}\n`);
+  console.log(`📁 Data dir: ${path.resolve(dataDir)}`);
+  console.log(`👥 Rate limiting: per Firebase UID (200+ concurrent users supported)\n`);
 });
 
 // ── Graceful shutdown ──────────────────────────────────────────────────────────
